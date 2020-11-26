@@ -3,20 +3,15 @@ An extensible implementation of the Causal Bert model from
 "Adapting Text Embeddings for Causal Inference" 
     (https://arxiv.org/abs/1905.12741)
 """
+import logging
+import argparse
+import pandas as pd
 from collections import defaultdict
-import os
-import pickle
 
-import scipy
-from sklearn.model_selection import KFold
+from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 
-from keras.preprocessing.sequence import pad_sequences
-from torch.utils.data import Dataset, TensorDataset, DataLoader, RandomSampler, SequentialSampler
-
-from transformers import BertTokenizer
-from transformers import BertModel, BertPreTrainedModel, AdamW, BertConfig
+from transformers import AdamW
 from transformers import get_linear_schedule_with_warmup
-from transformers.modeling_bert import BertPreTrainingHeads
 
 from transformers import DistilBertTokenizer
 from transformers import DistilBertModel, DistilBertPreTrainedModel
@@ -25,7 +20,6 @@ from torch.nn import CrossEntropyLoss
 
 import torch
 import torch.nn as nn
-from scipy.special import softmax
 import numpy as np
 from scipy.special import logit
 from sklearn.linear_model import LogisticRegression
@@ -35,6 +29,7 @@ import math
 
 CUDA = (torch.cuda.device_count() > 0)
 MASK_IDX = 103
+logger = logging.getLogger()
 
 
 def platt_scale(outcome, probs):
@@ -71,7 +66,6 @@ def make_bow_vector(ids, vocab_size, use_counts=False):
     if not use_counts:
         vec = (vec != 0).float()
     return vec
-
 
 
 class CausalBert(DistilBertPreTrainedModel):
@@ -171,17 +165,14 @@ class CausalBert(DistilBertPreTrainedModel):
         return g, Q0, Q1, g_loss, Q_loss, mlm_loss
 
 
-
 class CausalBertWrapper:
     """Model wrapper in charge of training and inference."""
 
-    def __init__(self, g_weight=1.0, Q_weight=0.1, mlm_weight=1.0,
-        batch_size=32):
-        self.model = CausalBert.from_pretrained(
-            "distilbert-base-uncased",
-            num_labels=2,
-            output_attentions=False,
-            output_hidden_states=False)
+    def __init__(self, g_weight=1.0, Q_weight=0.1, mlm_weight=1.0, batch_size=32):
+        self.model = CausalBert.from_pretrained("distilbert-base-uncased",
+                                                num_labels=2,
+                                                output_attentions=False,
+                                                output_hidden_states=False)
         if CUDA:
             self.model = self.model.cuda()
 
@@ -192,45 +183,36 @@ class CausalBertWrapper:
         }
         self.batch_size = batch_size
 
-
-    def train(self, texts, confounds, treatments, outcomes,
-            learning_rate=2e-5, epochs=3):
-        dataloader = self.build_dataloader(
-            texts, confounds, treatments, outcomes)
-
+    def train(self, texts, confounds, treatments, outcomes, learning_rate=2e-5, epochs=3):
+        dataloader = self.build_dataloader(texts, confounds, treatments, outcomes)
         self.model.train()
         optimizer = AdamW(self.model.parameters(), lr=learning_rate, eps=1e-8)
         total_steps = len(dataloader) * epochs
         warmup_steps = total_steps * 0.1
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
-
+        scheduler = get_linear_schedule_with_warmup(optimizer,
+                                                    num_warmup_steps=warmup_steps,
+                                                    num_training_steps=total_steps)
         for epoch in range(epochs):
             losses = []
             self.model.train()
             for step, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
-                    if CUDA: 
-                        batch = (x.cuda() for x in batch)
-                    W_ids, W_len, W_mask, C, T, Y = batch
-                    # while True:
-                    self.model.zero_grad()
-                    g, Q0, Q1, g_loss, Q_loss, mlm_loss = self.model(W_ids, W_len, W_mask, C, T, Y)
-                    loss = self.loss_weights['g'] * g_loss + \
-                            self.loss_weights['Q'] * Q_loss + \
-                            self.loss_weights['mlm'] * mlm_loss
-                    loss.backward()
-                    optimizer.step()
-                    scheduler.step()
-                    losses.append(loss.detach().cpu().item())
-                # print(np.mean(losses))
-                    # if step > 5: continue
-        return self.model
+                if CUDA:
+                    batch = (x.cuda() for x in batch)
+                W_ids, W_len, W_mask, C, T, Y = batch
+                self.model.zero_grad()
+                g, Q0, Q1, g_loss, Q_loss, mlm_loss = self.model(W_ids, W_len, W_mask, C, T, Y)
+                loss \
+                    = self.loss_weights['g']*g_loss + self.loss_weights['Q']*Q_loss + self.loss_weights['mlm']*mlm_loss
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+                losses.append(loss.detach().cpu().item())
 
+        return self.model
 
     def inference(self, texts, confounds, outcome=None):
         self.model.eval()
-        dataloader = self.build_dataloader(texts, confounds, outcomes=outcome,
-            sampler='sequential')
+        dataloader = self.build_dataloader(texts, confounds, outcomes=outcome, sampler='sequential')
         Q0s = []
         Q1s = []
         Ys = []
@@ -242,7 +224,6 @@ class CausalBertWrapper:
             Q0s += Q0.detach().cpu().numpy().tolist()
             Q1s += Q1.detach().cpu().numpy().tolist()
             Ys += Y.detach().cpu().numpy().tolist()
-            # if i > 5: break
         probs = np.array(list(zip(Q0s, Q1s)))
         preds = np.argmax(probs, axis=1)
 
@@ -278,7 +259,6 @@ class CausalBertWrapper:
 
         out = defaultdict(list)
         for i, (W, C, T, Y) in enumerate(zip(texts, confounds, treatments, outcomes)):
-            # out['W_raw'].append(W)
             encoded_sent = tokenizer.encode_plus(W, add_special_tokens=True,
                 max_length=128,
                 truncation=True,
@@ -290,31 +270,32 @@ class CausalBertWrapper:
             out['Y'].append(Y)
             out['T'].append(T)
             out['C'].append(C)
-            # if i > 100: break
 
         data = (torch.tensor(out[x]) for x in ['W_ids', 'W_len', 'W_mask', 'C', 'T', 'Y'])
         data = TensorDataset(*data)
         sampler = RandomSampler(data) if sampler == 'random' else SequentialSampler(data)
         dataloader = DataLoader(data, sampler=sampler, batch_size=self.batch_size)
-            # collate_fn=collate_CandT)
 
         return dataloader
 
 
-if __name__ == '__main__':
-    import pandas as pd
+def main():
+    parser = argparse.ArgumentParser(description='Process some integers.')
+    parser.add_argument('data', metavar='DATA', type=str, help='input data')
+    parser.add_argument('-l', '--logging', action='store_true', help="Perform logging")
 
-    df = pd.read_csv('testdata.csv')
-    cb = CausalBertWrapper(batch_size=2,
-        g_weight=0.1, Q_weight=0.1, mlm_weight=1)
-    print(df.T)
+    args = parser.parse_args()
+
+    if args.logging:
+        logging.basicConfig(level=logging.INFO,
+                            format='%(asctime)s (%(relativeCreated)d ms) -> %(levelname)s:%(message)s',
+                            datefmt='%I:%M:%S %p')
+    df = pd.read_csv(args.data)
+    logging.info("Read data from {}".format(args.data))
+    cb = CausalBertWrapper(batch_size=2, g_weight=0.1, Q_weight=0.1, mlm_weight=1)
     cb.train(df['text'], df['C'], df['T'], df['Y'], epochs=1)
-    print(cb.ATE(df['C'], df.text, platt_scaling=True))
+    logger.info("ATE = {}".format(cb.ATE(df['C'], df.text, platt_scaling=True)))
 
 
-
-
-
-
-
-
+if __name__ == '__main__':
+    main()
