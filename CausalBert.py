@@ -282,11 +282,12 @@ class CausalBertWrapper:
 def main():
     parser = argparse.ArgumentParser(description='Process some integers.')
     parser.add_argument('data', metavar='DATA', type=str, help='input data')
-    parser.add_argument('-l', '--logging', action='store_false', help="Perform logging")
+    parser.add_argument('-l', '--no_logging', action='store_true', help="Don't perform logging")
+    parser.add_argument('-e', '--epochs', type=int, default=1, help='number of epochs to train')
 
     args = parser.parse_args()
 
-    if args.logging:
+    if not args.no_logging:
         logging.basicConfig(level=logging.INFO,
                             format='%(asctime)s (%(relativeCreated)d ms) -> %(levelname)s: %(message)s',
                             datefmt='%I:%M:%S %p')
@@ -303,11 +304,11 @@ def main():
     # Split into train and test
     logging.info("Splitting into train and test...")
     train = df.query("split == 'train'")
-    test = df.query("split == 'test'")
+    test = df.query("split == 'test' | split == 'dev'")
 
     cb = CausalBertWrapper(batch_size=2, g_weight=0.1, Q_weight=0.1, mlm_weight=1)
-    logging.info("Training Sentiment Causal BERT...")
-    cb.train(train['abstract'], train['C'], train['sentiment_label'], train['accepted'], epochs=1)
+    logging.info("Training Sentiment Causal BERT for {} epoch(s)...".format(args.epochs))
+    cb.train(train['abstract'], train['C'], train['sentiment_label'], train['accepted'], epochs=args.epochs)
     logging.info("Calculating ATE on test set...")
     logger.info("ATE = {}".format(cb.ATE(test['C'], test.abstract, platt_scaling=True)))
 
