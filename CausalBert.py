@@ -304,7 +304,6 @@ def main():
     logging.info("Preprocessing data...")
     logging.info("Positive sentiment set to be > {}".format(args.cutoff))
     df.loc[:, 'sentiment_label'] = (df[args.sentiment] > args.cutoff).astype(int)
-    df.loc[:, args.treatment] = df[args.treatment].astype(int)
     # Sean: as far as I can tell, C just represents possible confounders outside of the text.
     # We only consider confounders within the text
     df.loc[:, 'C'] = 0
