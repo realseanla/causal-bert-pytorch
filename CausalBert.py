@@ -216,6 +216,7 @@ class CausalBertWrapper:
         Q0s = []
         Q1s = []
         Ys = []
+        gs = []
         for i, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
             if CUDA: 
                 batch = (x.cuda() for x in batch)
@@ -224,13 +225,15 @@ class CausalBertWrapper:
             Q0s += Q0.detach().cpu().numpy().tolist()
             Q1s += Q1.detach().cpu().numpy().tolist()
             Ys += Y.detach().cpu().numpy().tolist()
+            gs += g.detach().cpu().numpy().tolist()
         probs = np.array(list(zip(Q0s, Q1s)))
         preds = np.argmax(probs, axis=1)
+        gs = torch.tensor(gs, dtype=torch.float64)
 
-        return probs, preds, Ys
+        return probs, preds, Ys, gs
 
     def ATE(self, C, W, Y=None, platt_scaling=False):
-        Q_probs, _, Ys = self.inference(W, C, outcome=Y)
+        Q_probs, _, Ys, _ = self.inference(W, C, outcome=Y)
         if platt_scaling and Y is not None:
             Q0 = platt_scale(Ys, Q_probs[:, 0])[:, 0]
             Q1 = platt_scale(Ys, Q_probs[:, 1])[:, 1]
@@ -240,8 +243,20 @@ class CausalBertWrapper:
 
         return np.mean(Q0 - Q1)
 
-    def build_dataloader(self, texts, confounds, treatments=None, outcomes=None,
-        tokenizer=None, sampler='random'):
+    def ATT(self, C, W, Y=None, platt_scaling=False):
+        Q_probs, _, Ys, gs = self.inference(W, C, outcome=Y)
+        if platt_scaling and Y is not None:
+            Q0 = platt_scale(Ys, Q_probs[:, 0])[:, 0].squeeze()
+            Q1 = platt_scale(Ys, Q_probs[:, 1])[:, 1].squeeze()
+        else:
+            Q0 = Q_probs[:, 0].squeeze()
+            Q1 = Q_probs[:, 1].squeeze()
+        T = torch.round(gs).type(torch.int)
+        T1_indices = (T == 1).nonzero().squeeze()
+
+        return np.mean(Q1[T1_indices] - Q0[T1_indices])
+
+    def build_dataloader(self, texts, confounds, treatments=None, outcomes=None, tokenizer=None, sampler='random'):
         def collate_CandT(data):
             # sort by (C, T), so you can get boundaries later
             # (do this here on cpu for speed)
@@ -285,7 +300,8 @@ def main():
     parser.add_argument('--epochs', type=int, default=1, help='number of epochs to train')
     parser.add_argument('--format', choices=['json', 'csv'], help='file format of data')
     parser.add_argument('--outcome', type=str, default='Y', help="name of outcome column in data")
-    parser.add_argument('--sentiment', type=str, default="sentiment", help="name of sentiment column in data")
+    parser.add_argument('--treatment', type=str, default='T', help="name of treatment column in data")
+    parser.add_argument('--sentiment', action="store_true", help="flag indicating that treatment is sentiment")
     parser.add_argument('--cutoff', type=float, default=0, help="Cut off for sentiment")
     parser.add_argument('--text', type=str, default='text', help="name of text column in data")
 
@@ -302,23 +318,41 @@ def main():
     elif args.format == 'csv':
         df = pd.read_csv(args.data)
     logging.info("Preprocessing data...")
-    logging.info("Positive sentiment set to be > {}".format(args.cutoff))
-    df.loc[:, 'sentiment_label'] = (df[args.sentiment] > args.cutoff).astype(int)
+    if args.sentiment:
+        logging.info("Using sentiment as treatment")
+        logging.info("Positive sentiment set to be > {}".format(args.cutoff))
+        treatment_label = 'sentiment_label'
+        df.loc[:, treatment_label] = (df[args.treatment] > args.cutoff)
+    else:
+        logging.info("Not using sentiment as treatment")
+        treatment_label = args.treatment
+    df.loc[:, treatment_label] = df[treatment_label].astype(int)
     df.loc[:, args.outcome] = df[args.outcome].astype(int)
     # Sean: as far as I can tell, C just represents possible confounders outside of the text.
     # We only consider confounders within the text
-    df.loc[:, 'C'] = 0.
+    df.loc[:, 'C'] = 0
 
     # Split into train and test
-    logging.info("Splitting into train and test...")
-    train = df.query("split == 'train'")
-    test = df.query("split == 'test' | split == 'dev'")
+    if args.sentiment:
+        logging.info("Splitting into train and test...")
+        train = df.query("split == 'train'")
+        test = df.query("split == 'test' | split == 'dev'")
+    else:
+        train = df
+        test = df
 
     cb = CausalBertWrapper(batch_size=2, g_weight=0.1, Q_weight=0.1, mlm_weight=1)
     logging.info("Training Sentiment Causal BERT for {} epoch(s)...".format(args.epochs))
-    cb.train(train[args.text], train['C'], train['sentiment_label'], train[args.outcome], epochs=args.epochs)
-    logging.info("Calculating ATE on test set...")
-    logger.info("ATE = {}".format(cb.ATE(test['C'], test[args.text], platt_scaling=True)))
+    cb.train(train[args.text], train['C'], train[treatment_label], train[args.outcome], epochs=args.epochs)
+
+    if args.sentiment:
+        logging.info("Calculating ATT with sentiment as treatment on test set...")
+        att = cb.ATT(test['C'], test[args.text], platt_scaling=True)
+        logging.info("ATT = {}".format(att))
+    else:
+        logging.info("Calculating ATE on test set...")
+        ate = cb.ATE(test['C'], test[args.text], platt_scaling=True)
+        logger.info("ATE = {}".format(ate))
 
 
 if __name__ == '__main__':
