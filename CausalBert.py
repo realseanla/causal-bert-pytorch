@@ -280,23 +280,31 @@ class CausalBertWrapper:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Process some integers.')
+    parser = argparse.ArgumentParser(description='Sentiment Causal BERT')
     parser.add_argument('data', metavar='DATA', type=str, help='input data')
-    parser.add_argument('-l', '--no_logging', action='store_true', help="Don't perform logging")
-    parser.add_argument('-e', '--epochs', type=int, default=1, help='number of epochs to train')
+    parser.add_argument('--epochs', type=int, default=1, help='number of epochs to train')
+    parser.add_argument('--format', choices=['json', 'csv'], help='file format of data')
+    parser.add_argument('--outcome', type=str, default='Y', help="name of outcome column in data")
+    parser.add_argument('--sentiment', type=str, default="sentiment", help="name of sentiment column in data")
+    parser.add_argument('--cutoff', type=float, default=0, help="Cut off for sentiment")
+    parser.add_argument('--text', type=str, default='text', help="name of text column in data")
 
     args = parser.parse_args()
 
-    if not args.no_logging:
-        logging.basicConfig(level=logging.INFO,
-                            format='%(asctime)s (%(relativeCreated)d ms) -> %(levelname)s: %(message)s',
-                            datefmt='%I:%M:%S %p')
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s (%(relativeCreated)d ms) -> %(levelname)s: %(message)s',
+                        datefmt='%I:%M:%S %p')
 
     logging.info("Reading data from {}".format(args.data))
-    df = pd.read_json(args.data).T
+    df = pd.DataFrame()
+    if args.format == 'json':
+        df = pd.read_json(args.data).T
+    elif args.format == 'csv':
+        df = pd.read_csv(args.data)
     logging.info("Preprocessing data...")
-    df.loc[:, 'sentiment_label'] = (df['sentiment'] > 0).astype(int)
-    df.loc[: ,'accepted'] = df['accepted'].astype(int)
+    logging.info("Positive sentiment set to be > {}".format(args.cutoff))
+    df.loc[:, 'sentiment_label'] = (df[args.sentiment] > args.cutoff).astype(int)
+    df.loc[:, args.treatment] = df[args.treatment].astype(int)
     # Sean: as far as I can tell, C just represents possible confounders outside of the text.
     # We only consider confounders within the text
     df.loc[:, 'C'] = 0
@@ -308,9 +316,9 @@ def main():
 
     cb = CausalBertWrapper(batch_size=2, g_weight=0.1, Q_weight=0.1, mlm_weight=1)
     logging.info("Training Sentiment Causal BERT for {} epoch(s)...".format(args.epochs))
-    cb.train(train['abstract'], train['C'], train['sentiment_label'], train['accepted'], epochs=args.epochs)
+    cb.train(train[args.text], train['C'], train['sentiment_label'], train[args.outcome], epochs=args.epochs)
     logging.info("Calculating ATE on test set...")
-    logger.info("ATE = {}".format(cb.ATE(test['C'], test.abstract, platt_scaling=True)))
+    logger.info("ATE = {}".format(cb.ATE(test['C'], test[args.text], platt_scaling=True)))
 
 
 if __name__ == '__main__':
