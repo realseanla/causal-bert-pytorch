@@ -254,7 +254,7 @@ class CausalBertWrapper:
         T = torch.round(gs).type(torch.int)
         T1_indices = (T == 1).nonzero().squeeze()
 
-        return np.mean(Q1[T1_indices] - Q0[T1_indices])
+        return np.mean(Q0[T1_indices] - Q1[T1_indices])
 
     def build_dataloader(self, texts, confounds, treatments=None, outcomes=None, tokenizer=None, sampler='random'):
         def collate_CandT(data):
