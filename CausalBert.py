@@ -302,6 +302,7 @@ def main():
     parser.add_argument('--outcome', type=str, default='Y', help="name of outcome column in data")
     parser.add_argument('--treatment', type=str, default='T', help="name of treatment column in data")
     parser.add_argument('--sentiment', action="store_true", help="flag indicating that treatment is sentiment")
+    parser.add_argument('--confounder', type=str, help='name of out-of-text confounder column')
     parser.add_argument('--cutoff', type=float, default=0, help="Cut off for sentiment")
     parser.add_argument('--text', type=str, default='text', help="name of text column in data")
 
@@ -317,7 +318,9 @@ def main():
         df = pd.read_json(args.data).T
     elif args.format == 'csv':
         df = pd.read_csv(args.data)
+
     logging.info("Preprocessing data...")
+
     if args.sentiment:
         logging.info("Using sentiment as treatment")
         logging.info("Positive sentiment set to be > {}".format(args.cutoff))
@@ -326,11 +329,15 @@ def main():
     else:
         logging.info("Not using sentiment as treatment")
         treatment_label = args.treatment
+
     df.loc[:, treatment_label] = df[treatment_label].astype(int)
     df.loc[:, args.outcome] = df[args.outcome].astype(int)
-    # Sean: as far as I can tell, C just represents possible confounders outside of the text.
-    # We only consider confounders within the text
-    df.loc[:, 'C'] = 0
+
+    if args.confounder is not None:
+        confounder_column = args.confounder
+    else:
+        confounder_column = 'C'
+        df.loc[:, confounder_column] = 0
 
     # Split into train and test
     if args.sentiment:
@@ -343,16 +350,19 @@ def main():
 
     cb = CausalBertWrapper(batch_size=2, g_weight=0.1, Q_weight=0.1, mlm_weight=1)
     logging.info("Training Sentiment Causal BERT for {} epoch(s)...".format(args.epochs))
-    cb.train(train[args.text], train['C'], train[treatment_label], train[args.outcome], epochs=args.epochs)
+    cb.train(train[args.text],
+             train[confounder_column],
+             train[treatment_label],
+             train[args.outcome],
+             epochs=args.epochs)
 
-    if args.sentiment:
-        logging.info("Calculating ATT with sentiment as treatment on test set...")
-        att = cb.ATT(test['C'], test[args.text], platt_scaling=True)
-        logging.info("ATT = {}".format(att))
-    else:
-        logging.info("Calculating ATE on test set...")
-        ate = cb.ATE(test['C'], test[args.text], platt_scaling=True)
-        logger.info("ATE = {}".format(ate))
+    logging.info("Calculating ATT...")
+    att = cb.ATT(test[confounder_column], test[args.text], platt_scaling=True)
+    logging.info("ATT = {}".format(att))
+
+    logging.info("Calculating ATE...")
+    ate = cb.ATE(test[confounder_column], test[args.text], platt_scaling=True)
+    logger.info("ATE = {}".format(ate))
 
 
 if __name__ == '__main__':
