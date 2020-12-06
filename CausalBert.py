@@ -194,6 +194,9 @@ class CausalBertWrapper:
                                                     num_training_steps=total_steps)
         for epoch in range(epochs):
             losses = []
+            g_losses = []
+            Q_losses = []
+            mlm_losses = []
             self.model.train()
             for step, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
                 if CUDA:
@@ -207,6 +210,17 @@ class CausalBertWrapper:
                 optimizer.step()
                 scheduler.step()
                 losses.append(loss.detach().cpu().item())
+                g_losses.append(g_loss.detach().cpu().item())
+                Q_losses.append(Q_loss.detach().cpu().item())
+                mlm_losses.append(mlm_loss.detach().cpu().item())
+            total_loss = np.mean(losses)
+            total_g_loss = np.mean(g_losses)
+            total_Q_loss = np.mean(Q_losses)
+            total_mlm_loss = np.mean(mlm_losses)
+            logger.info("Epoch {} total loss: {}".format(epoch, total_loss))
+            logger.info("Epoch {} propensity loss: {}".format(epoch, total_g_loss))
+            logger.info("Epoch {} conditional outcome loss: {}".format(epoch, total_Q_loss))
+            logger.info("Epoch {} masked language model loss: {}".format(epoch, total_mlm_loss))
 
         return self.model
 
