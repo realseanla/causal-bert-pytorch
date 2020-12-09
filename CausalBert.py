@@ -244,16 +244,12 @@ class CausalBertWrapper:
             training_losses['Q'].append(training_Q_loss)
 
             dev_g_loss, dev_Q_loss = self.evaluate_losses(dev)
-            logger.info("Epoch {} dev total loss: {}".format(epoch, dev_total_loss))
             logger.info("Epoch {} dev propensity loss: {}".format(epoch, dev_g_loss))
             logger.info("Epoch {} dev conditional outcome loss: {}".format(epoch, dev_Q_loss))
-            logger.info("Epoch {} dev masked language model loss: {}".format(epoch, dev_mlm_loss))
 
             dev_losses['epoch'].append(epoch)
-            dev_losses['total'].append(dev_total_loss)
             dev_losses['g'].append(dev_g_loss)
             dev_losses['Q'].append(dev_Q_loss)
-            dev_losses['mlm'].append(dev_mlm_loss)
 
         training_losses = pd.DataFrame.from_dict(training_losses)
         dev_losses = pd.DataFrame.from_dict(dev_losses)
@@ -425,7 +421,7 @@ def main():
     train_fig.savefig("{}_training_losses.png".format(args.experiment))
 
     dev_fig \
-        = dev_losses.plot(x='epoch', y=['mlm', 'g', 'Q', 'total'], title='Dev losses over epochs').get_figure()
+        = dev_losses.plot(x='epoch', y=['g', 'Q'], title='Dev losses over epochs').get_figure()
     dev_fig.savefig("{}_dev_losses.png".format(args.experiment))
 
     logging.info("Calculating ATT with inferred treatments...")
