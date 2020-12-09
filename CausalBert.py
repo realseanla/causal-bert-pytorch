@@ -439,8 +439,12 @@ def main():
         = dev_losses.plot(x='epoch', y=['mlm', 'g', 'Q', 'total'], title='Dev losses over epochs').get_figure()
     dev_fig.savefig("{}_dev_losses.png".format(args.experiment))
 
-    logging.info("Calculating ATT...")
+    logging.info("Calculating ATT with inferred treatments...")
     att = cb.ATT(test['C'], test['text'], platt_scaling=True)
+    logging.info("ATT = {}".format(att))
+
+    logging.info("Calculating ATT with ground-truth treatments...")
+    att = cb.ATT(test['C'], test['text'], T=test['T'], platt_scaling=True)
     logging.info("ATT = {}".format(att))
 
     logging.info("Calculating ATE...")
