@@ -266,9 +266,9 @@ class CausalBertWrapper:
 
     def evaluate_losses(self, dev):
         self.model.eval()
-        dataloader = self.build_dataloader(dev['text'], dev['C'], outcomes=None, sampler='sequential')
+        dataloader = self.build_dataloader(dev['text'], dev['C'], dev['T'], dev['Y'], sampler='sequential')
 
-        with torch.no_grad:
+        with torch.no_grad():
             total_losses = []
             g_losses = []
             Q_losses = []
@@ -277,12 +277,12 @@ class CausalBertWrapper:
                 if CUDA:
                     batch = (x.cuda() for x in batch)
                 W_ids, W_len, W_mask, C, T, Y = batch
-                _, _, _, g_loss, Q_loss, mlm_loss = self.model(W_ids, W_len, W_mask, C, T, use_mlm=False)
+                _, _, _, g_loss, Q_loss, mlm_loss = self.model(W_ids, W_len, W_mask, C, T, Y, use_mlm=False)
                 total_loss = self.calculate_total_loss(g_loss, Q_loss, mlm_loss)
-                total_losses.append(total_loss.detach().cpu().item())
-                g_losses.append(g_loss.detach().cpu().item())
-                Q_losses.append(Q_loss.detach().cpu().item())
-                mlm_losses.append(mlm_loss.detach().cpu().item())
+                total_losses.append(total_loss)
+                g_losses.append(g_loss)
+                Q_losses.append(Q_loss)
+                mlm_losses.append(mlm_loss)
             total_loss = np.mean(total_losses)
             g_loss = np.mean(g_losses)
             Q_loss = np.mean(Q_losses)
@@ -410,20 +410,16 @@ def main():
         logging.info("Not using sentiment as treatment")
         df.loc[:, 'T'] = df[args.treatment]
     df.loc[:, 'T'] = df['T'].astype(int)
-    df.drop(args.treatment, inplace=True)
 
     df.loc[:, 'Y'] = df[args.outcome].astype(int)
-    df.drop(args.outcome, inplace=True)
 
     if args.confounder is not None:
         df.loc[:, 'C'] = df[args.confounder]
-        df.drop(args.confounder, inplace=True)
     else:
         df.loc[:, 'C'] = 0
 
     # Rename the text column
     df.loc[:, 'text'] = df[args.text]
-    df.drop(args.text, inplace=True)
 
     # Split into train and test
     logging.info("Splitting into train and test...")
