@@ -18,7 +18,7 @@ from transformers import get_linear_schedule_with_warmup
 from transformers import DistilBertTokenizer
 from transformers import DistilBertModel, DistilBertPreTrainedModel
 
-from torch.nn import CrossEntropyLoss
+from torch.nn import CrossEntropyLoss, SmoothL1Loss
 
 import torch
 import torch.nn as nn
@@ -102,7 +102,7 @@ class CausalBert(DistilBertPreTrainedModel):
 
         self.init_weights()
 
-    def forward(self, W_ids, W_len, W_mask, C, T, Y=None, use_mlm=True):
+    def forward(self, W_ids, W_len, W_mask, C, T, Y=None, use_mlm=True, response='binary'):
         if use_mlm:
             W_len = W_len.unsqueeze(1) - 2 # -2 because of the +1 below
             mask_class = torch.cuda.FloatTensor if CUDA else torch.FloatTensor
@@ -154,10 +154,15 @@ class CausalBert(DistilBertPreTrainedModel):
             T1_indices = (T == 1).nonzero().squeeze()
             Y_T0_labels = Y.clone().scatter(0, T1_indices, -100)
 
-            Q_loss_T1 = CrossEntropyLoss()(
-                Q_logits_T1.view(-1, self.num_labels), Y_T1_labels)
-            Q_loss_T0 = CrossEntropyLoss()(
-                Q_logits_T0.view(-1, self.num_labels), Y_T0_labels)
+            if response == 'binary':
+                loss_function = CrossEntropyLoss()
+            elif response == 'continuous':
+                loss_function = SmoothL1Loss()
+            else:
+                raise ValueError("{} is not an appropriate response type".format(response))
+
+            Q_loss_T1 = loss_function(Q_logits_T1.view(-1, self.num_labels), Y_T1_labels)
+            Q_loss_T0 = loss_function(Q_logits_T0.view(-1, self.num_labels), Y_T0_labels)
 
             Q_loss = Q_loss_T0 + Q_loss_T1
         else:
@@ -174,13 +179,17 @@ class CausalBert(DistilBertPreTrainedModel):
 class CausalBertWrapper:
     """Model wrapper in charge of training and inference."""
 
-    def __init__(self, g_weight=1.0, Q_weight=0.1, mlm_weight=1.0, batch_size=32):
+    def __init__(self, g_weight=1.0, Q_weight=0.1, mlm_weight=1.0, batch_size=32, response='binary'):
         self.model = CausalBert.from_pretrained("distilbert-base-uncased",
                                                 num_labels=2,
                                                 output_attentions=False,
                                                 output_hidden_states=False)
         if CUDA:
             self.model = self.model.cuda()
+
+        if response not in ['binary', 'continuous']:
+            raise ValueError("{} not accepted response type".format(response))
+        self.response = response
 
         self.loss_weights = {
             'g': g_weight,
@@ -214,7 +223,7 @@ class CausalBertWrapper:
                 W_ids, W_len, W_mask, C, T, Y = batch
 
                 self.model.zero_grad()
-                g, Q0, Q1, g_loss, Q_loss, mlm_loss = self.model(W_ids, W_len, W_mask, C, T, Y)
+                g, Q0, Q1, g_loss, Q_loss, mlm_loss = self.model(W_ids, W_len, W_mask, C, T, Y, response=self.response)
                 loss \
                     = self.loss_weights['g'] * g_loss + self.loss_weights['Q'] * Q_loss + self.loss_weights['mlm'] * mlm_loss
 
@@ -267,7 +276,8 @@ class CausalBertWrapper:
                 if CUDA:
                     batch = (x.cuda() for x in batch)
                 W_ids, W_len, W_mask, C, T, Y = batch
-                _, _, _, g_loss, Q_loss, _ = self.model(W_ids, W_len, W_mask, C, T, Y, use_mlm=False)
+                _, _, _, g_loss, Q_loss, _ \
+                    = self.model(W_ids, W_len, W_mask, C, T, Y, use_mlm=False, response=self.response)
                 g_losses.append(g_loss.detach().cpu().item())
                 Q_losses.append(Q_loss.detach().cpu().item())
             g_loss = np.mean(g_losses)
@@ -285,7 +295,7 @@ class CausalBertWrapper:
             if CUDA: 
                 batch = (x.cuda() for x in batch)
             W_ids, W_len, W_mask, C, T, Y = batch
-            g, Q0, Q1, _, _, _ = self.model(W_ids, W_len, W_mask, C, T, use_mlm=False)
+            g, Q0, Q1, _, _, _ = self.model(W_ids, W_len, W_mask, C, T, use_mlm=False, response=self.response)
             Q0s += Q0.detach().cpu().numpy().tolist()
             Q1s += Q1.detach().cpu().numpy().tolist()
             Ys += Y.detach().cpu().numpy().tolist()
@@ -317,6 +327,9 @@ class CausalBertWrapper:
             Q1 = Q_probs[:, 1].squeeze()
         if T is None:
             T = torch.round(gs).type(torch.int)
+        else:
+            T = np.array(T, dtype=np.int)
+            T = torch.tensor(T, dtype=torch.int)
         T1_indices = (T == 1).nonzero().squeeze()
 
         return np.mean(Q0[T1_indices] - Q1[T1_indices])
