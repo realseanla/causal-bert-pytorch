@@ -243,7 +243,7 @@ class CausalBertWrapper:
             training_losses['mlm'].append(training_mlm_loss)
             training_losses['Q'].append(training_Q_loss)
 
-            dev_total_loss, dev_g_loss, dev_Q_loss, dev_mlm_loss = self.evaluate_losses(dev)
+            dev_g_loss, dev_Q_loss = self.evaluate_losses(dev)
             logger.info("Epoch {} dev total loss: {}".format(epoch, dev_total_loss))
             logger.info("Epoch {} dev propensity loss: {}".format(epoch, dev_g_loss))
             logger.info("Epoch {} dev conditional outcome loss: {}".format(epoch, dev_Q_loss))
