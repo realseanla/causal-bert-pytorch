@@ -3,9 +3,11 @@ An extensible implementation of the Causal Bert model from
 "Adapting Text Embeddings for Causal Inference" 
     (https://arxiv.org/abs/1905.12741)
 """
+import random
 import logging
 import argparse
 import pandas as pd
+import matplotlib.pyplot as plt
 from collections import defaultdict
 
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
@@ -30,6 +32,10 @@ import math
 CUDA = (torch.cuda.device_count() > 0)
 MASK_IDX = 103
 logger = logging.getLogger()
+
+random.seed(0)
+np.random.seed(0)
+torch.manual_seed(0)
 
 
 def platt_scale(outcome, probs):
@@ -183,8 +189,13 @@ class CausalBertWrapper:
         }
         self.batch_size = batch_size
 
-    def train(self, texts, confounds, treatments, outcomes, learning_rate=2e-5, epochs=3):
-        dataloader = self.build_dataloader(texts, confounds, treatments, outcomes)
+    def calculate_total_loss(self, g_loss, Q_loss, mlm_loss):
+        loss \
+            = self.loss_weights['g'] * g_loss + self.loss_weights['Q'] * Q_loss + self.loss_weights['mlm'] * mlm_loss
+        return loss
+
+    def train(self, train, dev, learning_rate=2e-5, epochs=3):
+        dataloader = self.build_dataloader(train['text'], train['C'], train['T'], train['Y'])
         self.model.train()
         optimizer = AdamW(self.model.parameters(), lr=learning_rate, eps=1e-8)
         total_steps = len(dataloader) * epochs
@@ -192,37 +203,91 @@ class CausalBertWrapper:
         scheduler = get_linear_schedule_with_warmup(optimizer,
                                                     num_warmup_steps=warmup_steps,
                                                     num_training_steps=total_steps)
+        training_losses = {'epoch': [], 'total': [], 'g': [], 'Q': [], 'mlm': []}
+        dev_losses = {'epoch': [], 'total': [], 'g': [], 'Q': [], 'mlm': []}
+
         for epoch in range(epochs):
-            losses = []
+            total_losses = []
             g_losses = []
             Q_losses = []
             mlm_losses = []
             self.model.train()
+
             for step, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
                 if CUDA:
                     batch = (x.cuda() for x in batch)
                 W_ids, W_len, W_mask, C, T, Y = batch
+
                 self.model.zero_grad()
                 g, Q0, Q1, g_loss, Q_loss, mlm_loss = self.model(W_ids, W_len, W_mask, C, T, Y)
-                loss \
-                    = self.loss_weights['g']*g_loss + self.loss_weights['Q']*Q_loss + self.loss_weights['mlm']*mlm_loss
+                loss = self.calculate_total_loss(g_loss, Q_loss, mlm_loss)
+
                 loss.backward()
                 optimizer.step()
                 scheduler.step()
-                losses.append(loss.detach().cpu().item())
+
+                total_losses.append(loss.detach().cpu().item())
                 g_losses.append(g_loss.detach().cpu().item())
                 Q_losses.append(Q_loss.detach().cpu().item())
                 mlm_losses.append(mlm_loss.detach().cpu().item())
-            total_loss = np.mean(losses)
-            total_g_loss = np.mean(g_losses)
-            total_Q_loss = np.mean(Q_losses)
-            total_mlm_loss = np.mean(mlm_losses)
-            logger.info("Epoch {} total loss: {}".format(epoch, total_loss))
-            logger.info("Epoch {} propensity loss: {}".format(epoch, total_g_loss))
-            logger.info("Epoch {} conditional outcome loss: {}".format(epoch, total_Q_loss))
-            logger.info("Epoch {} masked language model loss: {}".format(epoch, total_mlm_loss))
 
-        return self.model
+            training_total_loss = np.mean(total_losses)
+            training_g_loss = np.mean(g_losses)
+            training_Q_loss = np.mean(Q_losses)
+            training_mlm_loss = np.mean(mlm_losses)
+
+            logger.info("Epoch {} train total loss: {}".format(epoch, training_total_loss))
+            logger.info("Epoch {} train propensity loss: {}".format(epoch, training_g_loss))
+            logger.info("Epoch {} train conditional outcome loss: {}".format(epoch, training_Q_loss))
+            logger.info("Epoch {} train masked language model loss: {}".format(epoch, training_mlm_loss))
+
+            training_losses['epoch'].append(epoch)
+            training_losses['total'].append(training_total_loss)
+            training_losses['g'].append(training_g_loss)
+            training_losses['mlm'].append(training_mlm_loss)
+            training_losses['Q'].append(training_Q_loss)
+
+            dev_total_loss, dev_g_loss, dev_Q_loss, dev_mlm_loss = self.evaluate_losses(dev)
+            logger.info("Epoch {} dev total loss: {}".format(epoch, dev_total_loss))
+            logger.info("Epoch {} dev propensity loss: {}".format(epoch, dev_g_loss))
+            logger.info("Epoch {} dev conditional outcome loss: {}".format(epoch, dev_Q_loss))
+            logger.info("Epoch {} dev masked language model loss: {}".format(epoch, dev_mlm_loss))
+
+            dev_losses['epoch'].append(epoch)
+            dev_losses['total'].append(dev_total_loss)
+            dev_losses['g'].append(dev_g_loss)
+            dev_losses['Q'].append(dev_Q_loss)
+            dev_losses['mlm'].append(dev_mlm_loss)
+
+        training_losses = pd.DataFrame.from_dict(training_losses)
+        dev_losses = pd.DataFrame.from_dict(dev_losses)
+
+        return training_losses, dev_losses
+
+    def evaluate_losses(self, dev):
+        self.model.eval()
+        dataloader = self.build_dataloader(dev['text'], dev['C'], outcomes=None, sampler='sequential')
+
+        with torch.no_grad:
+            total_losses = []
+            g_losses = []
+            Q_losses = []
+            mlm_losses = []
+            for i, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
+                if CUDA:
+                    batch = (x.cuda() for x in batch)
+                W_ids, W_len, W_mask, C, T, Y = batch
+                _, _, _, g_loss, Q_loss, mlm_loss = self.model(W_ids, W_len, W_mask, C, T, use_mlm=False)
+                total_loss = self.calculate_total_loss(g_loss, Q_loss, mlm_loss)
+                total_losses.append(total_loss.detach().cpu().item())
+                g_losses.append(g_loss.detach().cpu().item())
+                Q_losses.append(Q_loss.detach().cpu().item())
+                mlm_losses.append(mlm_loss.detach().cpu().item())
+            total_loss = np.mean(total_losses)
+            g_loss = np.mean(g_losses)
+            Q_loss = np.mean(Q_losses)
+            mlm_loss = np.mean(mlm_losses)
+        return total_loss, g_loss, Q_loss, mlm_loss
 
     def inference(self, texts, confounds, outcome=None):
         self.model.eval()
@@ -257,7 +322,7 @@ class CausalBertWrapper:
 
         return np.mean(Q0 - Q1)
 
-    def ATT(self, C, W, Y=None, platt_scaling=False):
+    def ATT(self, C, W, T=None, Y=None, platt_scaling=False):
         Q_probs, _, Ys, gs = self.inference(W, C, outcome=Y)
         if platt_scaling and Y is not None:
             Q0 = platt_scale(Ys, Q_probs[:, 0])[:, 0].squeeze()
@@ -265,7 +330,8 @@ class CausalBertWrapper:
         else:
             Q0 = Q_probs[:, 0].squeeze()
             Q1 = Q_probs[:, 1].squeeze()
-        T = torch.round(gs).type(torch.int)
+        if T is None:
+            T = torch.round(gs).type(torch.int)
         T1_indices = (T == 1).nonzero().squeeze()
 
         return np.mean(Q0[T1_indices] - Q1[T1_indices])
@@ -319,6 +385,7 @@ def main():
     parser.add_argument('--confounder', type=str, help='name of out-of-text confounder column')
     parser.add_argument('--cutoff', type=float, default=0, help="Cut off for sentiment")
     parser.add_argument('--text', type=str, default='text', help="name of text column in data")
+    parser.add_argument('--experiment', type=str, default='experiment', help="name of experiment")
 
     args = parser.parse_args()
 
@@ -338,44 +405,50 @@ def main():
     if args.sentiment:
         logging.info("Using sentiment as treatment")
         logging.info("Positive sentiment set to be > {}".format(args.cutoff))
-        treatment_label = 'sentiment_label'
-        df.loc[:, treatment_label] = (df[args.treatment] > args.cutoff)
+        df.loc[:, 'T'] = (df[args.treatment] > args.cutoff)
     else:
         logging.info("Not using sentiment as treatment")
-        treatment_label = args.treatment
+        df.loc[:, 'T'] = df[args.treatment]
+    df.loc[:, 'T'] = df['T'].astype(int)
+    df.drop(args.treatment, inplace=True)
 
-    df.loc[:, treatment_label] = df[treatment_label].astype(int)
-    df.loc[:, args.outcome] = df[args.outcome].astype(int)
+    df.loc[:, 'Y'] = df[args.outcome].astype(int)
+    df.drop(args.outcome, inplace=True)
 
     if args.confounder is not None:
-        confounder_column = args.confounder
+        df.loc[:, 'C'] = df[args.confounder]
+        df.drop(args.confounder, inplace=True)
     else:
-        confounder_column = 'C'
-        df.loc[:, confounder_column] = 0
+        df.loc[:, 'C'] = 0
+
+    # Rename the text column
+    df.loc[:, 'text'] = df[args.text]
+    df.drop(args.text, inplace=True)
 
     # Split into train and test
-    if args.sentiment:
-        logging.info("Splitting into train and test...")
-        train = df.query("split == 'train'")
-        test = df.query("split == 'test' | split == 'dev'")
-    else:
-        train = df
-        test = df
+    logging.info("Splitting into train and test...")
+    train = df.query("split == 'train'")
+    dev = df.query("split == 'dev'")
+    test = df.query("split == 'test'")
 
     cb = CausalBertWrapper(batch_size=2, g_weight=0.1, Q_weight=0.1, mlm_weight=1)
     logging.info("Training Sentiment Causal BERT for {} epoch(s)...".format(args.epochs))
-    cb.train(train[args.text],
-             train[confounder_column],
-             train[treatment_label],
-             train[args.outcome],
-             epochs=args.epochs)
+    train_losses, dev_losses = cb.train(train, dev, epochs=args.epochs)
+
+    train_fig \
+        = train_losses.plot(x='epoch', y=['mlm', 'g', 'Q', 'total'], title='Training losses over epochs').get_figure()
+    train_fig.savefig("{}_training_losses.png".format(args.experiment))
+
+    dev_fig \
+        = dev_losses.plot(x='epoch', y=['mlm', 'g', 'Q', 'total'], title='Dev losses over epochs').get_figure()
+    dev_fig.savefig("{}_dev_losses.png".format(args.experiment))
 
     logging.info("Calculating ATT...")
-    att = cb.ATT(test[confounder_column], test[args.text], platt_scaling=True)
+    att = cb.ATT(test['C'], test['text'], platt_scaling=True)
     logging.info("ATT = {}".format(att))
 
     logging.info("Calculating ATE...")
-    ate = cb.ATE(test[confounder_column], test[args.text], platt_scaling=True)
+    ate = cb.ATE(test['C'], test['text'], platt_scaling=True)
     logger.info("ATE = {}".format(ate))
 
 
