@@ -189,11 +189,6 @@ class CausalBertWrapper:
         }
         self.batch_size = batch_size
 
-    def calculate_total_loss(self, g_loss, Q_loss, mlm_loss):
-        loss \
-            = self.loss_weights['g'] * g_loss + self.loss_weights['Q'] * Q_loss + self.loss_weights['mlm'] * mlm_loss
-        return loss
-
     def train(self, train, dev, learning_rate=2e-5, epochs=3):
         dataloader = self.build_dataloader(train['text'], train['C'], train['T'], train['Y'])
         self.model.train()
@@ -220,7 +215,8 @@ class CausalBertWrapper:
 
                 self.model.zero_grad()
                 g, Q0, Q1, g_loss, Q_loss, mlm_loss = self.model(W_ids, W_len, W_mask, C, T, Y)
-                loss = self.calculate_total_loss(g_loss, Q_loss, mlm_loss)
+                loss \
+                    = self.loss_weights['g'] * g_loss + self.loss_weights['Q'] * Q_loss + self.loss_weights['mlm'] * mlm_loss
 
                 loss.backward()
                 optimizer.step()
@@ -269,25 +265,18 @@ class CausalBertWrapper:
         dataloader = self.build_dataloader(dev['text'], dev['C'], dev['T'], dev['Y'], sampler='sequential')
 
         with torch.no_grad():
-            total_losses = []
             g_losses = []
             Q_losses = []
-            mlm_losses = []
             for i, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
                 if CUDA:
                     batch = (x.cuda() for x in batch)
                 W_ids, W_len, W_mask, C, T, Y = batch
-                _, _, _, g_loss, Q_loss, mlm_loss = self.model(W_ids, W_len, W_mask, C, T, Y, use_mlm=False)
-                total_loss = self.calculate_total_loss(g_loss, Q_loss, mlm_loss)
-                total_losses.append(total_loss)
-                g_losses.append(g_loss)
-                Q_losses.append(Q_loss)
-                mlm_losses.append(mlm_loss)
-            total_loss = np.mean(total_losses)
+                _, _, _, g_loss, Q_loss, _ = self.model(W_ids, W_len, W_mask, C, T, Y, use_mlm=False)
+                g_losses.append(g_loss.detach().cpu().item())
+                Q_losses.append(Q_loss.detach().cpu().item())
             g_loss = np.mean(g_losses)
             Q_loss = np.mean(Q_losses)
-            mlm_loss = np.mean(mlm_losses)
-        return total_loss, g_loss, Q_loss, mlm_loss
+        return g_loss, Q_loss
 
     def inference(self, texts, confounds, outcome=None):
         self.model.eval()
