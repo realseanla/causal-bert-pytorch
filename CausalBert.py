@@ -199,7 +199,7 @@ class CausalBertWrapper:
                                                     num_warmup_steps=warmup_steps,
                                                     num_training_steps=total_steps)
         training_losses = {'epoch': [], 'total': [], 'g': [], 'Q': [], 'mlm': []}
-        dev_losses = {'epoch': [], 'total': [], 'g': [], 'Q': [], 'mlm': []}
+        dev_losses = {'epoch': [], 'g': [], 'Q': []}
 
         for epoch in range(epochs):
             total_losses = []
