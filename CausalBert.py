@@ -381,6 +381,8 @@ def main():
     parser.add_argument('--epochs', type=int, default=1, help='number of epochs to train')
     parser.add_argument('--format', choices=['json', 'csv'], help='file format of data')
     parser.add_argument('--outcome', type=str, default='Y', help="name of outcome column in data")
+    parser.add_argument('--outcome_type', choices=['binary', 'continuous'], default='binary',
+                        help='data type of outcome')
     parser.add_argument('--treatment', type=str, default='T', help="name of treatment column in data")
     parser.add_argument('--sentiment', action="store_true", help="flag indicating that treatment is sentiment")
     parser.add_argument('--confounder', type=str, help='name of out-of-text confounder column')
@@ -412,7 +414,10 @@ def main():
         df.loc[:, 'T'] = df[args.treatment]
     df.loc[:, 'T'] = df['T'].astype(int)
 
-    df.loc[:, 'Y'] = df[args.outcome].astype(int)
+    df.loc[:, 'Y'] = df[args.outcome]
+
+    if args.outcome_type == 'binary':
+        df.loc[:, 'Y'] = df['Y'].astype(int)
 
     if args.confounder is not None:
         df.loc[:, 'C'] = df[args.confounder]
@@ -428,7 +433,7 @@ def main():
     dev = df.query("split == 'dev'")
     test = df.query("split == 'test'")
 
-    cb = CausalBertWrapper(batch_size=2, g_weight=0.1, Q_weight=0.1, mlm_weight=1)
+    cb = CausalBertWrapper(batch_size=2, g_weight=0.1, Q_weight=0.1, mlm_weight=1, response=args.outcome_type)
     logging.info("Training Sentiment Causal BERT for {} epoch(s)...".format(args.epochs))
     train_losses, dev_losses = cb.train(train, dev, epochs=args.epochs)
 
