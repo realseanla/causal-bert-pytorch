@@ -101,6 +101,49 @@ class CausalBert(DistilBertPreTrainedModel):
             self.config.num_labels)
 
         self.init_weights()
+    
+    def forward_pretrain(self, W_ids, W_len, W_mask, C, T=None, use_mlm=True):
+        # Only predict treatment given text
+        if use_mlm:
+            W_len = W_len.unsqueeze(1) - 2 # -2 because of the +1 below
+            mask_class = torch.cuda.FloatTensor if CUDA else torch.FloatTensor
+            mask = (mask_class(W_len.shape).uniform_() * W_len.float()).long() + 1 # + 1 to avoid CLS
+            target_words = torch.gather(W_ids, 1, mask)
+            mlm_labels = torch.ones(W_ids.shape).long() * -100
+            if CUDA:
+                mlm_labels = mlm_labels.cuda()
+            mlm_labels.scatter_(1, mask, target_words)
+            W_ids.scatter_(1, mask, MASK_IDX)
+
+        outputs = self.distilbert(W_ids, attention_mask=W_mask)
+        seq_output = outputs[0]
+        pooled_output = seq_output[:, 0]
+        # seq_output, pooled_output = outputs[:2]
+        # pooled_output = self.dropout(pooled_output)
+
+        if use_mlm:
+            prediction_logits = self.vocab_transform(seq_output)  # (bs, seq_length, dim)
+            prediction_logits = gelu(prediction_logits)  # (bs, seq_length, dim)
+            prediction_logits = self.vocab_layer_norm(prediction_logits)  # (bs, seq_length, dim)
+            prediction_logits = self.vocab_projector(prediction_logits)  # (bs, seq_length, vocab_size)
+            mlm_loss = CrossEntropyLoss()(
+                prediction_logits.view(-1, self.vocab_size), mlm_labels.view(-1))
+        else:
+            mlm_loss = 0.0
+
+        C_bow = make_bow_vector(C.unsqueeze(1), self.num_labels)
+        inputs = torch.cat((pooled_output, C_bow), 1)
+
+        # g logits
+        g = self.g_cls(inputs)
+        if T is not None:  # TODO train/test mode, this is a lil hacky
+            g_loss = CrossEntropyLoss()(g.view(-1, self.num_labels), T.view(-1))
+        else:
+            g_loss = 0.0
+        
+        sm = nn.Softmax(dim=1)
+        g = sm(g)[:, 1]
+        return g, g_loss, mlm_loss
 
     def forward(self, W_ids, W_len, W_mask, C, T, Y=None, use_mlm=True, response='binary'):
         if use_mlm:
@@ -182,11 +225,16 @@ class CausalBert(DistilBertPreTrainedModel):
 class CausalBertWrapper:
     """Model wrapper in charge of training and inference."""
 
-    def __init__(self, g_weight=1.0, Q_weight=0.1, mlm_weight=1.0, batch_size=32, response='binary'):
+    def __init__(self, g_weight=1.0, Q_weight=0.1, mlm_weight=1.0, batch_size=32, response='binary', load_path=None):
         self.model = CausalBert.from_pretrained("distilbert-base-uncased",
                                                 num_labels=2,
                                                 output_attentions=False,
                                                 output_hidden_states=False)
+        import pdb; pdb.set_trace()
+        if load_path:
+            logger.info(f'LOADING CAUSAL BERT WEIGHTS FROM {load_path}')
+            self.model.load_state_dict(torch.load(load_path))
+        
         if CUDA:
             self.model = self.model.cuda()
 
@@ -200,6 +248,65 @@ class CausalBertWrapper:
             'mlm': mlm_weight
         }
         self.batch_size = batch_size
+    
+    def pretrain(self, train, dev, learning_rate=2e-5, epochs=3):
+        dataloader = self.build_dataloader(train['text'], train['C'], train['T'], train['Y'])
+        self.model.train()
+        optimizer = AdamW(self.model.parameters(), lr=learning_rate, eps=1e-8)
+        total_steps = len(dataloader) * epochs
+        warmup_steps = total_steps * 0.1
+        scheduler = get_linear_schedule_with_warmup(optimizer,
+                                                    num_warmup_steps=warmup_steps,
+                                                    num_training_steps=total_steps)
+        training_losses = {'epoch': [], 'total': [], 'g': [], 'mlm': []}
+        dev_losses = {'epoch': [], 'g': []}
+
+        for epoch in range(epochs):
+            total_losses = []
+            g_losses = []
+            mlm_losses = []
+            self.model.train()
+
+            for step, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
+                if CUDA:
+                    batch = (x.cuda() for x in batch)
+                W_ids, W_len, W_mask, C, T, Y = batch
+
+                self.model.zero_grad()
+                g, g_loss, mlm_loss = self.model.forward_pretrain(W_ids, W_len, W_mask, C, T)
+                loss = self.loss_weights['g'] * g_loss + self.loss_weights['mlm'] * mlm_loss
+
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+
+                total_losses.append(loss.detach().cpu().item())
+                g_losses.append(g_loss.detach().cpu().item())
+                mlm_losses.append(mlm_loss.detach().cpu().item())
+
+            training_total_loss = np.mean(total_losses)
+            training_g_loss = np.mean(g_losses)
+            training_mlm_loss = np.mean(mlm_losses)
+
+            logger.info("Epoch {} train total loss: {}".format(epoch, training_total_loss))
+            logger.info("Epoch {} train propensity loss: {}".format(epoch, training_g_loss))
+            logger.info("Epoch {} train masked language model loss: {}".format(epoch, training_mlm_loss))
+
+            training_losses['epoch'].append(epoch)
+            training_losses['total'].append(training_total_loss)
+            training_losses['g'].append(training_g_loss)
+            training_losses['mlm'].append(training_mlm_loss)
+
+            dev_g_loss = self.evaluate_losses_pretrain(dev)
+            logger.info("Epoch {} dev propensity loss: {}".format(epoch, dev_g_loss))
+
+            dev_losses['epoch'].append(epoch)
+            dev_losses['g'].append(dev_g_loss)
+
+        training_losses = pd.DataFrame.from_dict(training_losses)
+        dev_losses = pd.DataFrame.from_dict(dev_losses)
+
+        return training_losses, dev_losses
 
     def train(self, train, dev, learning_rate=2e-5, epochs=3):
         dataloader = self.build_dataloader(train['text'], train['C'], train['T'], train['Y'])
@@ -267,6 +374,21 @@ class CausalBertWrapper:
         dev_losses = pd.DataFrame.from_dict(dev_losses)
 
         return training_losses, dev_losses
+    
+    def evaluate_losses_pretrain(self, dev):
+        self.model.eval()
+        dataloader = self.build_dataloader(dev['text'], dev['C'], dev['T'], dev['Y'], sampler='sequential')
+
+        with torch.no_grad():
+            g_losses = []
+            for i, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
+                if CUDA:
+                    batch = (x.cuda() for x in batch)
+                W_ids, W_len, W_mask, C, T, Y = batch
+                _, g_loss, _ = self.model.forward_pretrain(W_ids, W_len, W_mask, C, T)
+                g_losses.append(g_loss.detach().cpu().item())
+            g_loss = np.mean(g_losses)
+        return g_loss
 
     def evaluate_losses(self, dev):
         self.model.eval()
@@ -389,6 +511,9 @@ def main():
     parser.add_argument('--cutoff', type=float, default=0, help="Cut off for sentiment")
     parser.add_argument('--text', type=str, default='text', help="name of text column in data")
     parser.add_argument('--experiment', type=str, default='experiment', help="name of experiment")
+    parser.add_argument('--pretrain', action="store_true", help="whether to only train propensity score estimator")
+    parser.add_argument('--load_path', type=str, help="Path to some pre-trained weights", default=None)
+    parser.add_argument('--save_path', type=str, help="Path to save the model weights", default=None)
 
     args = parser.parse_args()
 
@@ -435,30 +560,44 @@ def main():
     dev = df.query("split == 'dev'")
     test = df.query("split == 'test'")
 
-    cb = CausalBertWrapper(batch_size=2, g_weight=0.1, Q_weight=0.1, mlm_weight=1, response=args.outcome_type)
-    logging.info("Training Sentiment Causal BERT for {} epoch(s)...".format(args.epochs))
-    train_losses, dev_losses = cb.train(train, dev, epochs=args.epochs)
+    cb = CausalBertWrapper(batch_size=2, g_weight=0.1, Q_weight=0.1, mlm_weight=1, 
+                            response=args.outcome_type, load_path=args.load_path)
 
-    train_fig \
-        = train_losses.plot(x='epoch', y=['mlm', 'g', 'Q', 'total'], title='Training losses over epochs').get_figure()
-    train_fig.savefig("{}_training_losses.png".format(args.experiment))
+    if args.pretrain:
+        logging.info("Pretraining Sentiment Classifier {} epoch(s)...".format(args.epochs))
+        train_losses, dev_losses = cb.pretrain(train, dev, epochs=args.epochs)
+        train_fig = train_losses.plot(x='epoch', y=['mlm', 'g', 'total'], title='Training losses over epochs').get_figure()
+        train_fig.savefig("figures/{}_training_losses_pretrain.png".format(args.experiment))
 
-    dev_fig \
-        = dev_losses.plot(x='epoch', y=['g', 'Q'], title='Dev losses over epochs').get_figure()
-    dev_fig.savefig("{}_dev_losses.png".format(args.experiment))
+        dev_fig = dev_losses.plot(x='epoch', y=['g'], title='Dev losses over epochs').get_figure()
+        dev_fig.savefig("figures/{}_dev_losses_pretrain.png".format(args.experiment))
+    else:
+        logging.info("Training Sentiment Causal BERT for {} epoch(s)...".format(args.epochs))
+        train_losses, dev_losses = cb.train(train, dev, epochs=args.epochs)
 
-    logging.info("Calculating ATT with inferred treatments...")
-    att = cb.ATT(test['C'], test['text'], platt_scaling=True)
-    logging.info("ATT = {}".format(att))
+        train_fig \
+            = train_losses.plot(x='epoch', y=['mlm', 'g', 'Q', 'total'], title='Training losses over epochs').get_figure()
+        train_fig.savefig("figures/{}_training_losses.png".format(args.experiment))
 
-    logging.info("Calculating ATT with ground-truth treatments...")
-    att = cb.ATT(test['C'], test['text'], T=test['T'], platt_scaling=True)
-    logging.info("ATT = {}".format(att))
+        dev_fig \
+            = dev_losses.plot(x='epoch', y=['g', 'Q'], title='Dev losses over epochs').get_figure()
+        dev_fig.savefig("figures/{}_dev_losses.png".format(args.experiment))
 
-    logging.info("Calculating ATE...")
-    ate = cb.ATE(test['C'], test['text'], platt_scaling=True)
-    logger.info("ATE = {}".format(ate))
+        logging.info("Calculating ATT with inferred treatments...")
+        att = cb.ATT(test['C'], test['text'], platt_scaling=True)
+        logging.info("ATT = {}".format(att))
 
+        logging.info("Calculating ATT with ground-truth treatments...")
+        att = cb.ATT(test['C'], test['text'], T=test['T'], platt_scaling=True)
+        logging.info("ATT = {}".format(att))
+
+        logging.info("Calculating ATE...")
+        ate = cb.ATE(test['C'], test['text'], platt_scaling=True)
+        logger.info("ATE = {}".format(ate))
+
+    if args.save_path:
+        logger.info(f'SAVING CAUSAL BERT WEIGHTS TO {args.save_path}')
+        torch.save(cb.model.state_dict(), args.save_path)
 
 if __name__ == '__main__':
     main()
