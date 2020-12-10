@@ -418,6 +418,8 @@ def main():
 
     if args.outcome_type == 'binary':
         df.loc[:, 'Y'] = df['Y'].astype(int)
+    else:
+        df.loc[:, 'Y'] = df['Y'].astype(np.float64)
 
     if args.confounder is not None:
         df.loc[:, 'C'] = df[args.confounder]
