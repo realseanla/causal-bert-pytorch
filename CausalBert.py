@@ -149,10 +149,7 @@ class CausalBert(DistilBertPreTrainedModel):
 
         if Y is not None:
             T0_indices = (T == 0).nonzero().squeeze()
-            Y_T1_labels = Y.clone().scatter(0, T0_indices, -100)
-
             T1_indices = (T == 1).nonzero().squeeze()
-            Y_T0_labels = Y.clone().scatter(0, T1_indices, -100)
 
             if response == 'binary':
                 loss_function = CrossEntropyLoss()
@@ -161,10 +158,16 @@ class CausalBert(DistilBertPreTrainedModel):
             else:
                 raise ValueError("{} is not an appropriate response type".format(response))
 
-            Q_loss_T1 = loss_function(Q_logits_T1.view(-1, self.num_labels), Y_T1_labels)
-            Q_loss_T0 = loss_function(Q_logits_T0.view(-1, self.num_labels), Y_T0_labels)
-
-            Q_loss = Q_loss_T0 + Q_loss_T1
+            Q_T0 = Q_logits_T0.view(-1, self.num_labels)[T0_indices, :].view(-1, self.num_labels)
+            Q_T1 = Q_logits_T1.view(-1, self.num_labels)[T1_indices, :].view(-1, self.num_labels)
+            Q = torch.cat([Q_T0, Q_T1], axis=0)
+            Y_shuffled = torch.cat([Y[T0_indices].view(-1, 1), Y[T1_indices].view(-1, 1)], axis=0).squeeze()
+            try:
+                Q_loss = loss_function(Q, Y_shuffled)
+            except IndexError:
+                Q_loss = torch.tensor(0.0)
+                if CUDA:
+                    Q_loss = Q_loss.cuda()
         else:
             Q_loss = 0.0
 
