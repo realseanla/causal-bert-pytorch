@@ -225,12 +225,15 @@ class CausalBert(DistilBertPreTrainedModel):
 class CausalBertWrapper:
     """Model wrapper in charge of training and inference."""
 
-    def __init__(self, g_weight=1.0, Q_weight=0.1, mlm_weight=1.0, batch_size=32, response='binary', load_path=None):
+    def __init__(self, g_weight=1.0, Q_weight=0.1, mlm_weight=1.0, batch_size=32, 
+                 response='binary', load_path=None, debug=False):
         self.model = CausalBert.from_pretrained("distilbert-base-uncased",
                                                 num_labels=2,
                                                 output_attentions=False,
                                                 output_hidden_states=False)
-        import pdb; pdb.set_trace()
+        if debug:
+            import pdb
+            pdb.set_trace()
         if load_path:
             logger.info(f'LOADING CAUSAL BERT WEIGHTS FROM {load_path}')
             self.model.load_state_dict(torch.load(load_path))
@@ -514,6 +517,7 @@ def main():
     parser.add_argument('--pretrain', action="store_true", help="whether to only train propensity score estimator")
     parser.add_argument('--load_path', type=str, help="Path to some pre-trained weights", default=None)
     parser.add_argument('--save_path', type=str, help="Path to save the model weights", default=None)
+    parser.add_argument('--debug', action='store_true', help="Turn on PDB in Causal BERT")
 
     args = parser.parse_args()
 
@@ -561,7 +565,7 @@ def main():
     test = df.query("split == 'test'")
 
     cb = CausalBertWrapper(batch_size=2, g_weight=0.1, Q_weight=0.1, mlm_weight=1, 
-                            response=args.outcome_type, load_path=args.load_path)
+                            response=args.outcome_type, load_path=args.load_path, debug=args.debug)
 
     if args.pretrain:
         logging.info("Pretraining Sentiment Classifier {} epoch(s)...".format(args.epochs))
